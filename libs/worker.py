@@ -1451,8 +1451,6 @@ class EvaluatorAuxiliary(EvaluatorOriginal):
                 window_ext = F.pad(window_ext, (0, input_vid_len - window_size))
                 window_ext = window_ext.cuda(non_blocking=True)
 
-
-
             fpn_logits_list, fpn_offsets_list = tuple(), tuple()
             with torch.no_grad():
                 if self.batchify_text_queries:
