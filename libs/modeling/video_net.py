@@ -1,5 +1,6 @@
 from copy import deepcopy
 import math
+import sys
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,6 +95,10 @@ class HieraMambaBackbone(nn.Module):
 
         # stem transformers
         self.stem = nn.ModuleList()
+        print("*"*40)
+        print(f'stem layer num: {len(self.stem)}')
+        print("*"*40)
+        sys.exit()
         for _ in range(arch[1]):
             self.stem.append(
                 TransformerEncoder(
@@ -146,7 +151,7 @@ class HieraMambaBackbone(nn.Module):
         if mask.ndim == 2:
             mask = mask.unsqueeze(1)    # (bs, l) -> (bs, 1, l)
 
-        # embedding projection
+        # ! embedding projection
         x, _ = self.embd_fc(x, mask)
 
         # embedding convs
@@ -188,10 +193,6 @@ class HieraMambaBackbone(nn.Module):
             return fpn, fpn_masks, anchor_fpn, anchor_fpn_masks
         else:
             return fpn, fpn_masks
-
-
-
-
 
 def make_video_net(opt):
     opt = deepcopy(opt)
