@@ -1,0 +1,13 @@
+numpy
+PyYAML
+tqdm
+tensorboard
+einops
+omegaconf
+packaging
+ninja
+setuptools==69.5.1
+wheel
+transformers==4.38.2
+causal-conv1d==1.4.0
+mamba-ssm==2.2.4
