@@ -32,7 +32,6 @@ AUX_LOSS_REGISTRY = {
 
 
 class TrainerOriginal:
-
     def __init__(self, opt):
 
         self.opt = opt
@@ -1352,12 +1351,7 @@ class EvaluatorOriginal:
         
         print0(f"Predictions saved to {predictions_file}")
         self.logger.write(f"Predictions saved to {predictions_file}")
-
-
-
-
-
-
+        
 class EvaluatorAuxiliary(EvaluatorOriginal):
     def __init__(self, opt):
         super().__init__(opt)

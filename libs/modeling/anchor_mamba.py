@@ -44,12 +44,13 @@ class BaseAnchorBlock(nn.Module):
         Args:
             stride: Stride for downsampling (number of tokens per anchor block)
             d_model: Model embedding dimension
+            # ! way to generate anchors
             pool_method: Pooling method for anchor generation. Options:
                         - "mean": Average pooling (default)
                         - "max": Max pooling 
                         - "attn": Attention pooling (CLIP-style with learnable query)
                         - "gated": Gated pooling (learnable mean/max combination)
-            dropout: Dropout probability (used for attention pooling)
+            dropout: Dropout probability (used for attention pooling)        
         """
         super().__init__()
         self.stride = stride
@@ -102,6 +103,7 @@ class BaseAnchorBlock(nn.Module):
         device = x.device
 
         # 1) Correctly calculate number of blocks and required padding
+        # ! compute the numbers of blocks
         num_blocks = (L + s - 1) // s
         needed_len = num_blocks * s
         pad_len = needed_len - L
@@ -116,6 +118,7 @@ class BaseAnchorBlock(nn.Module):
         x_blocks = x_padded.reshape(B, D, num_blocks, s)
 
         # 3) Generate anchors using the configurable pooling method
+        # ! generate anchor vectors
         anchors = self.anchor_pooling(x_padded)
         
         # 4) Vectorized interleaving: Concatenate anchors and token blocks
@@ -432,6 +435,7 @@ class AnchorMambaPoolingBlockGated(BaseAnchorBlock):
         self.norm_ffn = RMSNorm(d_model)
         self.drop_path_ffn = LayerScale2(d_model, dropout)
 
+    # ! AMP module forward main process part
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, D, L = x.shape
         device = x.device
