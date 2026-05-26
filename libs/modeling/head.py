@@ -4,7 +4,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import MaskedConv1D, LayerNorm, Scale
+from .blocks import MaskedConv1D, CausalMaskedConv1D, LayerNorm, Scale
 
 
 heads = dict()
@@ -27,23 +27,25 @@ class ClsHead(nn.Module):
         n_layers=2,     # number of conv layers
         prior_prob=0.0, # prior probability of positive class
         concat_text=False,  # whether to concatenate text with video features
+        causal=False,
     ):
         super().__init__()
         if concat_text:
             embd_dim = embd_dim + text_embd_dim
 
+        Conv = CausalMaskedConv1D if causal else MaskedConv1D
 
         self.convs, self.norms = nn.ModuleList(), nn.ModuleList()
         for _ in range(n_layers):
             self.convs.append(
-                MaskedConv1D(
+                Conv(
                     embd_dim, embd_dim,
                     kernel_size=3, stride=1, padding=1, bias=False
                 )
             )
             self.norms.append(LayerNorm(embd_dim))
 
-        self.cls_head = MaskedConv1D(
+        self.cls_head = Conv(
             embd_dim, 1, kernel_size=3, stride=1, padding=1
         )
 
@@ -81,21 +83,23 @@ class RegHead(nn.Module):
         num_fpn_levels, # number of FPN levels
         n_layers=2,     # number of conv layers
         concat_text=False,  # whether to concatenate text with video features
+        causal=False,
     ):
         super().__init__()
         if concat_text:
             embd_dim = embd_dim + text_embd_dim
+        Conv = CausalMaskedConv1D if causal else MaskedConv1D
         self.convs, self.norms = nn.ModuleList(), nn.ModuleList()
         for _ in range(n_layers):
             self.convs.append(
-                MaskedConv1D(
+                Conv(
                     embd_dim, embd_dim,
                     kernel_size=3, stride=1, padding=1, bias=False
                 )
             )
             self.norms.append(LayerNorm(embd_dim))
 
-        self.reg_head = MaskedConv1D(
+        self.reg_head = Conv(
             embd_dim, 2, kernel_size=3, stride=1, padding=1
         )
         self.scales = nn.ModuleList([Scale() for _ in range(num_fpn_levels)])

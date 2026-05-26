@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 python eval.py --name tacos_hieramamba --ckpt last
+CUDA_VISIBLE_DEVICES=0 python eval.py --name tacos_hieramamba_online --ckpt last

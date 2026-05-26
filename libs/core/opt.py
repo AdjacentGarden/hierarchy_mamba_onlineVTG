@@ -27,6 +27,9 @@ DEFAULTS = {
             'proj_pdrop': 0.1,
             'path_pdrop': 0.1,
             'use_abs_pe': True,
+            'online': False,
+            'bidirectional': True,
+            'causal_anchor': False,
         },
 
         'fusion': {
@@ -104,6 +107,9 @@ DEFAULTS = {
         'pre_nms_thresh': 0.001,
         'pre_nms_topk': 2000,
         'seg_len_thresh': 0.1,
+        'streaming': False,
+        'stream_cls_thresh': 0.5,
+        'stream_nms_iou_thresh': 0.7,
 
         'nms': {
             'mode': 'soft_nms',
