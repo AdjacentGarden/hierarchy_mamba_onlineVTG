@@ -6,7 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from hydra.modules.hydra import Hydra
+try:
+    from hydra.modules.hydra import Hydra
+except ModuleNotFoundError:
+    Hydra = None
 from mamba_ssm import Mamba2
 from .blocks import TransformerEncoder, MaskedMaxPool1D, SwiGLUFFN
 import os
@@ -37,7 +40,14 @@ class BaseAnchorBlock(nn.Module):
     All derived anchor blocks should inherit from this class to avoid code duplication
     and ensure consistent anchor handling.
     """
-    def __init__(self, stride: int, d_model: int, pool_method: str = "mean", dropout: float = 0.1):
+    def __init__(
+        self,
+        stride: int,
+        d_model: int,
+        pool_method: str = "mean",
+        dropout: float = 0.1,
+        causal_anchor: bool = False,
+    ):
         """
         Initialize BaseAnchorBlock with configurable pooling.
         
@@ -55,6 +65,7 @@ class BaseAnchorBlock(nn.Module):
         super().__init__()
         self.stride = stride
         self.d_model = d_model
+        self.causal_anchor = causal_anchor
         
         # Core anchor pooling component with configurable method
         self.anchor_pooling = AnchorPooling(
@@ -144,6 +155,51 @@ class BaseAnchorBlock(nn.Module):
         # in a subsequent operation (common for attention).
         expanded_mask = torch.zeros((B, x_combined.size(1), 1), dtype=torch.bool, device=device)
         expanded_mask[:, :nonmasked_len] = True
+
+        return x_combined, anchor_positions, expanded_mask, anchor_mask
+
+    def _generate_and_interleave_anchors_causal(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Online-safe interleaving:
+            [t0, ..., t{s-1}, anchor0, t{s}, ..., anchor1, ...]
+
+        The anchor sits after its source block. With a unidirectional Mamba,
+        this lets each anchor summarize only tokens that have already arrived.
+        """
+        B, D, L = x.shape
+        s = self.stride
+        device = x.device
+
+        num_blocks = (L + s - 1) // s
+        needed_len = num_blocks * s
+        pad_len = needed_len - L
+
+        x_padded = F.pad(x, (0, pad_len)) if pad_len > 0 else x
+        x_blocks = x_padded.reshape(B, D, num_blocks, s)
+        anchors = self.anchor_pooling(x_padded).unsqueeze(-1)
+
+        mixed = torch.cat((x_blocks, anchors), dim=-1)
+        x_combined = mixed.permute(0, 2, 3, 1).reshape(B, -1, D)
+        anchor_positions = torch.arange(
+            s,
+            x_combined.size(1),
+            s + 1,
+            device=device,
+        )
+
+        anchor_mask = downsample_mask(mask, s)
+        seq_mask = mask.squeeze(1)
+        if pad_len > 0:
+            seq_mask = F.pad(seq_mask, (0, pad_len), value=False)
+        seq_mask = seq_mask.view(B, num_blocks, s)
+        expanded_mask = torch.cat(
+            (seq_mask, anchor_mask.squeeze(1).unsqueeze(-1)),
+            dim=-1,
+        ).reshape(B, -1, 1)
 
         return x_combined, anchor_positions, expanded_mask, anchor_mask
 
@@ -299,6 +355,51 @@ class BaseAnchorBlock(nn.Module):
         seq_out    = seq_tokens.transpose(1, 2)[..., :original_seq_len]
 
         return anchor_out, seq_out
+
+    def _extract_anchor_and_sequence_outputs_causal(
+            self,
+            processed_features: torch.Tensor,
+            anchor_positions: torch.Tensor,
+            original_seq_len: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, combined_len, D = processed_features.shape
+        s = self.stride
+        step = s + 1
+        num_blocks = combined_len // step
+        mixed = processed_features.view(B, num_blocks, step, D)
+
+        seq_tokens = mixed[:, :, :s, :].reshape(B, num_blocks * s, D)
+        seq_out = seq_tokens.transpose(1, 2)[..., :original_seq_len]
+        anchor_out = mixed[:, :, s, :].transpose(1, 2)
+
+        return anchor_out, seq_out
+
+    def _generate_anchor_inputs(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.causal_anchor:
+            return self._generate_and_interleave_anchors_causal(x, mask)
+        return self._generate_and_interleave_anchors(x, mask)
+
+    def _extract_outputs(
+        self,
+        processed_features: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        original_seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.causal_anchor:
+            return self._extract_anchor_and_sequence_outputs_causal(
+                processed_features,
+                anchor_positions,
+                original_seq_len,
+            )
+        return self._extract_anchor_and_sequence_outputs(
+            processed_features,
+            anchor_positions,
+            original_seq_len,
+        )
     
     def _extract_anchor_and_sequence_outputs_initial(self, processed_features: torch.Tensor, anchor_positions: torch.Tensor, original_seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -375,22 +476,32 @@ class AnchorMambaPoolingBlockGated(BaseAnchorBlock):
         mamba_dstate: int = 64,
         mamba_expand: int = 2,
         mamba_dconv: int = 7,
-        bidirectional: bool = True
+        bidirectional: bool = True,
+        causal_anchor: bool = False,
     ):
-        super().__init__(stride=stride, d_model=d_model, pool_method=pool_method, dropout=dropout)
+        super().__init__(
+            stride=stride,
+            d_model=d_model,
+            pool_method=pool_method,
+            dropout=dropout,
+            causal_anchor=causal_anchor,
+        )
         
         self.local_encode = local_encode
         
         if bidirectional:
+            if Hydra is None:
+                raise ImportError("bidirectional=True requires hydra.modules.hydra")
             # Global encoder block 
             self.global_encoder = Hydra(
                 d_model=d_model, d_state=mamba_dstate, d_conv=mamba_dconv, expand=mamba_expand,
                 use_mem_eff_path=True, headdim=mamba_headdim
             )
         else:
+            d_conv = min(mamba_dconv, 4)
             self.global_encoder = Mamba2(
-                d_model=d_model, d_state=mamba_dstate, d_conv=4, expand=mamba_expand,
-                headdim=48
+                d_model=d_model, d_state=mamba_dstate, d_conv=d_conv, expand=mamba_expand,
+                headdim=mamba_headdim
             )
         # self.global_encoder = RWKVEncoder(d_model=d_model, n_layers=2)
         self.norm_global = RMSNorm(d_model)
@@ -446,7 +557,7 @@ class AnchorMambaPoolingBlockGated(BaseAnchorBlock):
         x.masked_fill_(~mask, 0.)  # In-place masking saves memory
 
         # Generate and interleave anchors
-        x_combined, anchor_positions, expanded_mask, anchor_mask = self._generate_and_interleave_anchors(x, mask)
+        x_combined, anchor_positions, expanded_mask, anchor_mask = self._generate_anchor_inputs(x, mask)
 
         # Global encoding with residual
         global_out = self.global_encoder(self.norm_global(x_combined))
@@ -476,7 +587,7 @@ class AnchorMambaPoolingBlockGated(BaseAnchorBlock):
         final_out = self.drop_path_ffn(ffn_out) + fused
 
         # Extract outputs
-        anchor_out, seq_out = self._extract_anchor_and_sequence_outputs(final_out, anchor_positions, L)
+        anchor_out, seq_out = self._extract_outputs(final_out, anchor_positions, L)
         return anchor_out, seq_out, anchor_mask, mask
         
     def forward_before(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -489,7 +600,7 @@ class AnchorMambaPoolingBlockGated(BaseAnchorBlock):
         x.masked_fill_(~mask, 0.)  # In-place masking
 
         # Generate and interleave anchors
-        x_combined, anchor_positions, expanded_mask, anchor_mask = self._generate_and_interleave_anchors(x, mask)
+        x_combined, anchor_positions, expanded_mask, anchor_mask = self._generate_anchor_inputs(x, mask)
         
         # Store original input for gating
         original_features = x_combined
@@ -529,7 +640,7 @@ class AnchorMambaPoolingBlockGated(BaseAnchorBlock):
         final_out = gate2_out + self.drop_path_ffn(ffn_out)
         
         # Extract anchor and sequence outputs
-        anchor_out, seq_out = self._extract_anchor_and_sequence_outputs(
+        anchor_out, seq_out = self._extract_outputs(
             final_out, anchor_positions, L
         )
         
@@ -570,22 +681,32 @@ class AnchorMambaPoolingBlock(BaseAnchorBlock):
         mamba_dstate: int = 64,
         mamba_expand: int = 2,
         mamba_dconv: int = 7,
-        bidirectional: bool = True
+        bidirectional: bool = True,
+        causal_anchor: bool = False,
     ):
-        super().__init__(stride=stride, d_model=d_model, pool_method=pool_method, dropout=dropout)
+        super().__init__(
+            stride=stride,
+            d_model=d_model,
+            pool_method=pool_method,
+            dropout=dropout,
+            causal_anchor=causal_anchor,
+        )
         
         self.local_encode = local_encode
 
         if bidirectional:
+            if Hydra is None:
+                raise ImportError("bidirectional=True requires hydra.modules.hydra")
             # Global encoder block 
             self.global_encoder = Hydra(
                 d_model=d_model, d_state=mamba_dstate, d_conv=mamba_dconv, expand=mamba_expand,
                 use_mem_eff_path=True, headdim=mamba_headdim
             )
         else:
+            d_conv = min(mamba_dconv, 4)
             self.global_encoder = Mamba2(
-                d_model=d_model, d_state=mamba_dstate, d_conv=4, expand=mamba_expand,
-                headdim=48
+                d_model=d_model, d_state=mamba_dstate, d_conv=d_conv, expand=mamba_expand,
+                headdim=mamba_headdim
             )
         self.norm_global_in = RMSNorm(d_model)
         self.drop_path_global_1 = LayerScale2(d_model, dropout)
@@ -644,7 +765,7 @@ class AnchorMambaPoolingBlock(BaseAnchorBlock):
         # 1) Interleave anchors  (compact expanded_mask is shape (B, T′) bool)
         # ---------------------------------------------------------------------
         x_combined, anchor_pos, expanded_mask, anchor_mask = \
-            self._generate_and_interleave_anchors(x, mask)          # T′ = (s+1)·blocks
+            self._generate_anchor_inputs(x, mask)          # T′ = (s+1)·blocks
         # x_combined : (B, T′, D)     expanded_mask : (B, T′)  bool
 
         # ---------------------------------------------------------------------
@@ -682,7 +803,7 @@ class AnchorMambaPoolingBlock(BaseAnchorBlock):
         # ---------------------------------------------------------------------
         # 5) Split back into anchor / sequence streams (view-only extraction)
         # ---------------------------------------------------------------------
-        anchor_out, seq_out = self._extract_anchor_and_sequence_outputs(
+        anchor_out, seq_out = self._extract_outputs(
             z,                                            # (B, T′, D)
             anchor_pos,                                   # anchor positions
             L                                             # trims padding

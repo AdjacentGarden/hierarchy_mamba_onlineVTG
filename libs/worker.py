@@ -960,6 +960,9 @@ class EvaluatorOriginal:
         )
         self.pre_nms_topk = opt['eval']['pre_nms_topk']
         self.pre_nms_thresh = opt['eval']['pre_nms_thresh']
+        self.streaming = opt['eval'].get('streaming', False)
+        self.stream_cls_thresh = opt['eval'].get('stream_cls_thresh', self.pre_nms_thresh)
+        self.stream_nms_iou_thresh = opt['eval'].get('stream_nms_iou_thresh', 0.7)
         self.seg_len_thresh = opt['eval']['seg_len_thresh']
         self.max_text_len = opt['eval'].get('max_text_len', 24)
         self.batchify_text_queries = opt['eval'].get('batchify_text_queries', True)
@@ -999,13 +1002,23 @@ class EvaluatorOriginal:
             
             for query_idx, (result, target) in enumerate(zip(results, targets)):
                 segs, scores = result['segments'], result['scores']
-                idx = scores.argsort(descending=True)
-                segs, scores = segs[idx[:self.topk]], scores[idx[:self.topk]]
+                if self.streaming:
+                    segs, scores = segs[:self.topk], scores[:self.topk]
+                else:
+                    idx = scores.argsort(descending=True)
+                    segs, scores = segs[idx[:self.topk]], scores[idx[:self.topk]]
                 target = torch.as_tensor(target, dtype=torch.float)
+                target_gt = target.cpu().numpy().tolist()
                 target = target.expand(len(segs), -1)
                 
-                iou_topk = iou(segs, target)
-                iou_n = np.array([iou_topk[:i].max().item() for i in self.ranks])
+                if len(segs) > 0:
+                    iou_topk = iou(segs, target)
+                    iou_n = np.array([
+                        iou_topk[:min(i, len(iou_topk))].max().item()
+                        for i in self.ranks
+                    ])
+                else:
+                    iou_n = np.zeros(len(self.ranks))
                 self.counts += (iou_n[:, None] >= self.iou_threshs[None])
                 video_iou_counts += (iou_n[:, None] >= self.iou_threshs[None])
                 
@@ -1015,7 +1028,7 @@ class EvaluatorOriginal:
                 
                 query_data = {
                     'query_id': query_idx,
-                    'ground_truth': target[0].cpu().numpy().tolist(),
+                    'ground_truth': target_gt,
                     'predictions': []
                 }
                 
@@ -1120,6 +1133,7 @@ class EvaluatorOriginal:
         input_vid_len = (window_size + (stride - 1)) // stride * stride
 
         segs_list, scores_list = tuple(), tuple()
+        stream_candidates = [[] for _ in tokens] if self.streaming else None
         for window, window_offset, window_ext in \
             zip(windows, window_offsets, window_ext_scores):
             window = F.pad(window, (0, input_vid_len - window_size))[None]
@@ -1156,6 +1170,15 @@ class EvaluatorOriginal:
             window_segs_list, window_scores_list = tuple(), tuple()
             for idx, (fpn_logits, fpn_offsets) in \
                 enumerate(zip(fpn_logits_list, fpn_offsets_list)):
+                if self.streaming:
+                    stream_candidates[idx].extend(
+                        self._collect_streaming_candidates(
+                            fpn_points, fpn_logits, fpn_offsets, fpn_masks,
+                            window_ext[idx] if window_ext is not None else None,
+                            window_offset
+                        )
+                    )
+                    continue
                 window_segs, window_scores = self._collect_segments(
                     fpn_points, fpn_logits, fpn_offsets, fpn_masks, 
                     window_ext[idx] if window_ext is not None else None
@@ -1164,8 +1187,16 @@ class EvaluatorOriginal:
                 window_segs_list += (window_segs.cpu(), )
                 window_scores_list += (window_scores.cpu(), )
 
-            segs_list += (window_segs_list, )
-            scores_list += (window_scores_list, )
+            if not self.streaming:
+                segs_list += (window_segs_list, )
+                scores_list += (window_scores_list, )
+
+        if self.streaming:
+            stream_results = [
+                self._accept_streaming_candidates(candidates)
+                for candidates in stream_candidates
+            ]
+            return self._format_streaming_results(stream_results, data)
 
         segs_list = [torch.cat(x) for x in zip(*segs_list)]     # [bs x (n, 2)]
         scores_list = [torch.cat(x) for x in zip(*scores_list)] # [bs x (n,)]
@@ -1312,6 +1343,122 @@ class EvaluatorOriginal:
 
         return segs, scores
 
+    def _temporal_iou_one_to_many(self, seg, accepted):
+        if len(accepted) == 0:
+            return seg.new_zeros((0,))
+        accepted = torch.stack(accepted, dim=0).to(seg.device)
+        left = torch.maximum(seg[0], accepted[:, 0])
+        right = torch.minimum(seg[1], accepted[:, 1])
+        inter = (right - left).clamp(min=0)
+        union = (seg[1] - seg[0]).clamp(min=0) + (accepted[:, 1] - accepted[:, 0]).clamp(min=0) - inter
+        return inter / union.clamp(min=1e-6)
+
+    def _collect_streaming_candidates(
+        self,
+        fpn_points,
+        fpn_logits,
+        fpn_offsets,
+        fpn_masks,
+        ext_scores,
+        window_offset,
+    ):
+        candidates = []
+        ext = ext_scores
+        for points, logits, offsets, masks in zip(
+            fpn_points, fpn_logits, fpn_offsets, fpn_masks
+        ):
+            logits, offsets, masks = logits[0], offsets[0], masks[0]
+            scores = torch.sigmoid(logits)
+            if ext is not None:
+                scores = scores * ext
+                ext = F.max_pool1d(
+                    ext[None, None], kernel_size=3, stride=2, padding=1
+                )[0, 0]
+            scores = scores * masks.float()
+
+            valid = scores > self.stream_cls_thresh
+            if not torch.any(valid):
+                continue
+
+            points_valid = points[valid]
+            scores_valid = scores[valid]
+            offsets_valid = offsets[valid]
+            pt_ctr = points_valid[:, 0]
+            left = pt_ctr - offsets_valid[:, 0] * points_valid[:, 3]
+            right = pt_ctr + offsets_valid[:, 1] * points_valid[:, 3]
+            segs = torch.stack((left, right), dim=-1)
+
+            seg_lens = right - left
+            keep = seg_lens > self.seg_len_thresh
+            if not torch.any(keep):
+                continue
+
+            segs = segs[keep] + window_offset / self.vid_stride
+            scores_valid = scores_valid[keep]
+            decision_time = points_valid[keep, 0] + points_valid[keep, 3] - 1 + window_offset / self.vid_stride
+
+            for t, score, seg in zip(decision_time, scores_valid, segs):
+                candidates.append((float(t.item()), float(score.item()), seg.detach()))
+
+        return candidates
+
+    def _accept_streaming_candidates(self, candidates):
+        accepted_segs, accepted_scores = [], []
+        candidates.sort(key=lambda x: x[0])
+        for _, score, seg in candidates:
+            overlaps = self._temporal_iou_one_to_many(seg, accepted_segs)
+            if len(overlaps) == 0 or torch.all(overlaps < self.stream_nms_iou_thresh):
+                accepted_segs.append(seg.cpu())
+                accepted_scores.append(torch.as_tensor(score))
+        return accepted_segs, accepted_scores
+
+    def _update_streaming_results(
+        self,
+        accepted_segs,
+        accepted_scores,
+        fpn_points,
+        fpn_logits,
+        fpn_offsets,
+        fpn_masks,
+        ext_scores,
+        window_offset,
+    ):
+        candidates = self._collect_streaming_candidates(
+            fpn_points,
+            fpn_logits,
+            fpn_offsets,
+            fpn_masks,
+            ext_scores,
+            window_offset,
+        )
+        candidates.sort(key=lambda x: x[0])
+        for _, score, seg in candidates:
+            overlaps = self._temporal_iou_one_to_many(seg, accepted_segs)
+            if len(overlaps) == 0 or torch.all(overlaps < self.stream_nms_iou_thresh):
+                accepted_segs.append(seg.cpu())
+                accepted_scores.append(torch.as_tensor(score))
+
+    def _format_streaming_results(self, stream_results, data):
+        results = tuple()
+        clip_stride = data['clip_stride']
+        clip_size = data['clip_size']
+        fps = data['fps']
+        duration = data['duration']
+
+        for accepted_segs, accepted_scores in stream_results:
+            if len(accepted_segs) > 0:
+                segs = torch.stack(accepted_segs, dim=0)
+                scores = torch.stack(accepted_scores).to(segs.dtype)
+                segs = segs * self.vid_stride
+                segs = (segs * clip_stride + 0.5 * clip_size) / fps
+                segs = torch.clamp(segs, min=0, max=duration)
+            else:
+                segs = torch.empty((0, 2))
+                scores = torch.empty((0,))
+            results += ({'segments': segs, 'scores': scores}, )
+
+        return results
+
     def log(self, is_last=False):
         metrics = self.counts / self.text_cnt
         log_str = "\nFinal:" if is_last else f"\n[{self.itr}/{self.num_itrs}]"
@@ -1435,6 +1582,7 @@ class EvaluatorAuxiliary(EvaluatorOriginal):
         input_vid_len = (window_size + (stride - 1)) // stride * stride
 
         segs_list, scores_list = tuple(), tuple()
+        stream_candidates = [[] for _ in tokens] if self.streaming else None
         for window, window_offset, window_ext in \
             zip(windows, window_offsets, window_ext_scores):
             window = F.pad(window, (0, input_vid_len - window_size))[None]
@@ -1495,6 +1643,15 @@ class EvaluatorAuxiliary(EvaluatorOriginal):
             window_segs_list, window_scores_list = tuple(), tuple()
             for idx, (fpn_logits, fpn_offsets) in \
                 enumerate(zip(fpn_logits_list, fpn_offsets_list)):
+                if self.streaming:
+                    stream_candidates[idx].extend(
+                        self._collect_streaming_candidates(
+                            fpn_points, fpn_logits, fpn_offsets, fpn_masks,
+                            window_ext[idx] if window_ext is not None else None,
+                            window_offset
+                        )
+                    )
+                    continue
                 window_segs, window_scores = self._collect_segments(
                     fpn_points, fpn_logits, fpn_offsets, fpn_masks, 
                     window_ext[idx] if window_ext is not None else None
@@ -1503,8 +1660,16 @@ class EvaluatorAuxiliary(EvaluatorOriginal):
                 window_segs_list += (window_segs.cpu(), )
                 window_scores_list += (window_scores.cpu(), )
 
-            segs_list += (window_segs_list, )
-            scores_list += (window_scores_list, )
+            if not self.streaming:
+                segs_list += (window_segs_list, )
+                scores_list += (window_scores_list, )
+
+        if self.streaming:
+            stream_results = [
+                self._accept_streaming_candidates(candidates)
+                for candidates in stream_candidates
+            ]
+            return self._format_streaming_results(stream_results, data)
 
         segs_list = [torch.cat(x) for x in zip(*segs_list)]     # [bs x (n, 2)]
         scores_list = [torch.cat(x) for x in zip(*scores_list)] # [bs x (n,)]

@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 python train.py --opt tacos_hieramamba.yaml --name tacos_hieramamba
+CUDA_VISIBLE_DEVICES=0 python train.py --opt tacos_hieramamba.yaml --name tacos_hieramamba_online
