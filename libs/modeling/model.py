@@ -86,11 +86,6 @@ class HieraMamba(nn.Module):
         super().__init__()
         self.early_fusion = opt.get('early_fusion', True)
         self.opt = opt
-        self.online = opt.get('vid_net', {}).get('online', False)
-        if self.online:
-            opt['fusion'].setdefault('causal', True)
-            opt['cls_head'].setdefault('causal', True)
-            opt['reg_head'].setdefault('causal', True)
         # backbones
         self.text_net = make_text_net(opt['text_net'])
         if self.early_fusion:

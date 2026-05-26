@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .blocks import (
-    sinusoid_encoding, MaskedConv1D, CausalMaskedConv1D, LayerNorm, TransformerEncoder, MaskedMaxPool1D
+    sinusoid_encoding, MaskedConv1D, LayerNorm, TransformerEncoder, MaskedMaxPool1D
 )
 
 # Import all block types
@@ -56,9 +56,7 @@ class HieraMambaBackbone(nn.Module):
         mamba_dstate=64,
         mamba_expand=2,
         mamba_dconv=7,
-        bidirectional=True,
-        online=False,
-        causal_anchor=False,
+        bidirectional=True
     ):
         super().__init__()
 
@@ -67,11 +65,6 @@ class HieraMambaBackbone(nn.Module):
         assert arch[0] >= int(math.log2(stride))
         self.max_seq_len = max_seq_len
         self.return_anchor = return_anchor
-        self.online = online
-        if self.online:
-            bidirectional = False
-            causal_anchor = True
-            local_encode = False
         local_encode_num_layers = arch[2] if local_encode_num_layers == 0 else local_encode_num_layers
         # embedding projection
         self.embd_fc = MaskedConv1D(in_dim, embd_dim, 1)
@@ -79,10 +72,9 @@ class HieraMambaBackbone(nn.Module):
         # embedding convs
         self.embd_convs = nn.ModuleList()
         self.embd_norms = nn.ModuleList()
-        Conv = CausalMaskedConv1D if self.online else MaskedConv1D
         for _ in range(arch[0]):
             self.embd_convs.append(
-                Conv(
+                MaskedConv1D(
                     embd_dim, embd_dim,
                     kernel_size=5 if stride > 1 else 3,
                     stride=2 if stride > 1 else 1,
@@ -103,6 +95,10 @@ class HieraMambaBackbone(nn.Module):
 
         # stem transformers
         self.stem = nn.ModuleList()
+        print("*"*40)
+        print(f'stem layer num: {len(self.stem)}')
+        print("*"*40)
+        sys.exit()
         for _ in range(arch[1]):
             self.stem.append(
                 TransformerEncoder(
@@ -134,8 +130,7 @@ class HieraMambaBackbone(nn.Module):
                     mamba_dstate=mamba_dstate,
                     mamba_expand=mamba_expand,
                     mamba_dconv=mamba_dconv,
-                    bidirectional=bidirectional,
-                    causal_anchor=causal_anchor,
+                    bidirectional=bidirectional
                 )
             )
         
@@ -146,6 +141,7 @@ class HieraMambaBackbone(nn.Module):
         if isinstance(module, (nn.Linear, nn.Conv1d)):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+
     def forward(self, x, mask):
         """
         Args:

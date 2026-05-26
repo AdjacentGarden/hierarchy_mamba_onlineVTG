@@ -138,55 +138,6 @@ class MaskedConv1D(nn.Module):
         return x, mask
 
 
-class CausalMaskedConv1D(nn.Module):
-    """
-    Masked 1D convolution with left-only temporal padding.
-    """
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        stride=1,
-        padding=0,
-        groups=1,
-        bias=True,
-    ):
-        super().__init__()
-
-        self.stride = stride
-        self.left_padding = kernel_size - 1
-        self.conv = nn.Conv1d(
-            in_channels, out_channels, kernel_size,
-            stride=stride, padding=0, groups=groups, bias=bias
-        )
-        if bias:
-            nn.init.zeros_(self.conv.bias)
-
-    def forward(self, x, mask):
-        assert x.size(-1) % self.stride == 0
-
-        if mask is None:
-            mask = torch.ones_like(x[:, :1], dtype=torch.bool)
-
-        if self.left_padding > 0:
-            x = F.pad(x, (self.left_padding, 0))
-            mask = F.pad(mask, (self.left_padding, 0), value=False)
-
-        mask_float = mask.to(x.dtype)
-        x = self.conv(x * mask_float)
-
-        if self.stride > 1:
-            mask_float = F.interpolate(
-                mask_float, size=x.size(-1), mode='nearest'
-            )
-            mask = mask_float.bool()
-        else:
-            mask = mask[..., -x.size(-1):]
-
-        return x, mask
-
-
 class LayerNorm(nn.Module):
     """
     LayerNorm that supports input of size (bs, c, t)
@@ -585,15 +536,13 @@ class ConvXAttNLayer(nn.Module):
         n_heads=4,          # number of attention heads
         attn_pdrop=0.0,     # dropout rate for attention map
         proj_pdrop=0.0,     # dropout rate for projection
-        causal=False,
     ):
         super(ConvXAttNLayer, self).__init__()
 
         self.use_conv = stride > 0
         if self.use_conv:
             assert stride == 1 or stride % 2 == 0
-            Conv = CausalMaskedConv1D if causal else MaskedConv1D
-            self.q_conv = Conv(
+            self.q_conv = MaskedConv1D(
                 embd_dim, embd_dim, 3, stride, 1, groups=embd_dim, bias=False
             )
             self.q_norm = LayerNorm(embd_dim)
@@ -707,7 +656,6 @@ class TransformerDecoder(nn.Module):
         proj_pdrop=0.0,     # dropout rate for projection
         path_pdrop=0.0,     # dropout rate for residual paths
         xattn_mode='adaln', # cross-attention mode (affine | adaln)
-        causal=False,
     ):
         super(TransformerDecoder, self).__init__()
 
@@ -717,7 +665,6 @@ class TransformerDecoder(nn.Module):
             embd_dim, kv_dim, embd_dim * 2,
             stride=1, n_heads=n_heads,
             attn_pdrop=attn_pdrop, proj_pdrop=proj_pdrop,
-            causal=causal,
         )
         self.ln_xattn_q = LayerNorm(embd_dim)
         self.ln_xattn_kv = LayerNorm(kv_dim)

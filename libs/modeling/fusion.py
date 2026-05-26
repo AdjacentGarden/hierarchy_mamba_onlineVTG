@@ -28,7 +28,6 @@ class XAttNFusion(nn.Module):
         proj_pdrop=0.0,     # dropout rate for projection
         path_pdrop=0.0,     # dropout rate for residual paths
         xattn_mode='adaln', # cross-attention mode (adaln | affine)
-        causal=False,
     ):
         super().__init__()
 
@@ -42,7 +41,6 @@ class XAttNFusion(nn.Module):
                     proj_pdrop=proj_pdrop,
                     path_pdrop=path_pdrop,
                     xattn_mode=xattn_mode,
-                    causal=causal,
                 )
             )
 

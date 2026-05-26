@@ -32,17 +32,14 @@ model:
     block_type: 'AnchorMambaPoolingBlockGated'  # AnchorMambaPoolingBlock| AnchorMambaPoolingBlockGated
     ffn_ratio: 2    
     return_anchor: true
+    local_encode: true
     local_encoder_type: 'transformer'  
     local_window_size: 5 # window size for local self-attention
     local_encode_num_layers: 0 # local encoder layers, 0 means all layers
     mamba_headdim: 64        
     mamba_dstate: 64 
     mamba_expand: 2 
-    mamba_dconv: 4
-    online: true
-    bidirectional: false
-    causal_anchor: true
-    local_encode: false
+    mamba_dconv: 7
 
   fusion:
     name: xattn
@@ -52,18 +49,15 @@ model:
     proj_pdrop: 0.1       # dropout rate for projection
     path_pdrop: 0.1       # dropout rate for residual path
     xattn_mode: affine    # cross-attention mode
-    causal: true
 
   cls_head:
     name: cls
     n_layers: 2           # number of conv layers (output layer excluded)
     prior_prob: 0.0       # prior probability for positive class
-    causal: true
 
   reg_head:
     name: reg
     n_layers: 2           # number of conv layers (output layer excluded)
-    causal: true
 
 pt_gen:
   regression_range: 4     # normalized regression range
@@ -143,10 +137,7 @@ eval:
     split: test
 
   ranks: [1, 5]
-  iou_threshs: [0.3, 0.5, 0.7]
-  streaming: true
-  stream_cls_thresh: 0.5
-  stream_nms_iou_thresh: 0.7
+  iou_threshs: [0.3, 0.5]
 
   pre_nms_topk: 2000
   pre_nms_thresh: 0.001
